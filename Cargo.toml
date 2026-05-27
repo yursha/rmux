@@ -9,3 +9,4 @@ libc = "0.2.186"
 nix = { version = "0.31.3", features = ["signal", "poll", "fs", "term", "process"] }
 polling = "3.11.0"
 scopeguard = "1.2.0"
+vt100 = "0.16.2"

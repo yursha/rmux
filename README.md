@@ -1,16 +1,8 @@
-1. The PTY Manager (The Foundation)
-A terminal multiplexer is essentially a controller that sits between a "Client" (your terminal window) and a "Server" (the shell process).
+Multiple Windows: spin up three different PtyChild processes, give each one its own dedicated vt100::Parser, and swap which parser you choose to render to stdout when the user presses a hotkey.
 
-The Task: Create a struct that spawns a child process (like bash) and attaches it to a PTY. You must be able to read the output from the PTY and write input to it.
+Split Screens: slice your physical window coordinates in half and draw the top half of vt_parser_1 on rows 1–20, and the top half of vt_parser_2 on rows 21–40.
 
-Key Concept: This is the "IO" part. You will be using poll or epoll to listen to multiple file descriptors simultaneously.
-
-2. The Terminal Emulator (The Buffer)
-tmux is not just a pipe; it is a virtual terminal. When the shell sends raw ANSI escape sequences (like "move cursor to 0,0" or "turn text red"), tmux must interpret those and draw them onto a virtual grid (a Vec<Vec<Cell>>).
-
-The Technology: You should study the vte crate (used by GNOME Terminal) or vt100. Do not write an ANSI parser from scratch unless you want to spend months debugging terminal compatibility.
-
-The Task: Maintain a 2D grid representing the screen. When the shell sends a command, update this grid.
+set up an array of terminal states next and capture a key command like Ctrl+B to create a new session window
 
 3. The Layout Engine (The Window Manager)
 This is where you handle the "splits" and "windows."
@@ -28,8 +20,6 @@ The Strategy: Use serde for serialization. The server holds the state (the PTYs 
 
 Recommended Roadmap for a "Rust-tmux" MVP
 If you want to make progress, start with this "Hello World" of multiplexing:
-
-Phase 1: Use nix to spawn a shell in a PTY and echo its output to your terminal.
 
 Phase 2: Use crossterm or ratatui to build the UI shell.
 

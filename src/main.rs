@@ -49,6 +49,10 @@ fn sync_terminal_size(master: &impl AsRawFd) {
     };
     unsafe {
         if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            // Subtract 1 row to reserve space for our persistent status bar!
+            if ws.ws_row > 1 {
+                ws.ws_row -= 1;
+            }
             libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
         }
     }
@@ -84,14 +88,11 @@ fn write_stdout_blocking(stdout: &mut StdoutLock, mut data: &[u8]) -> std::io::R
 }
 
 /// Processes incoming target application text streaming out of the PTY master channel.
-fn handle_pty_data(master: &OwnedFd, stdout: &mut StdoutLock, buffer: &mut [u8]) -> Result<bool, Box<dyn std::error::Error>> {
+fn handle_pty_data(master: &OwnedFd, parser: &mut vt100::Parser, buffer: &mut [u8]) -> Result<bool, Box<dyn std::error::Error>> {
     match nix::unistd::read(master, buffer) {
         Ok(0) => return Ok(false), // Clean EOF
         Ok(n) => {
-            if let Err(e) = write_stdout_blocking(stdout, &buffer[..n]) {
-                eprintln!("\r\nStdout Write Error: {}\r\n", e);
-                return Ok(false);
-            }
+            parser.process(&buffer[..n]);
         }
         Err(nix::errno::Errno::EAGAIN) => {}
         Err(nix::errno::Errno::EIO) => return Ok(false), // Traditional Linux PTY session termination
@@ -126,10 +127,16 @@ fn handle_stdin_data(stdin: &mut StdinLock, master: &OwnedFd, buffer: &mut [u8])
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let child = PtyChild::spawn_bash().expect("Failed to spawn bash");
     
-    // 1. Terminal Layout and Signal Registration
+    let mut physical_size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut physical_size); }
+
     sync_terminal_size(&child.master);
     let sigwinch_action = SigAction::new(SigHandler::Handler(handle_sigwinch), SaFlags::empty(), SigSet::empty());
     unsafe { sigaction(Signal::SIGWINCH, &sigwinch_action)?; }
+
+    // Allocate the virtual matrix grid using the isolated row count
+    let pty_rows = if physical_size.ws_row > 1 { physical_size.ws_row - 1 } else { physical_size.ws_row };
+    let mut vt_parser = vt100::Parser::new(pty_rows, physical_size.ws_col, 0);
 
     // 2. High-Performance Locked I/O Initialization
     let stdin_handle = stdin();
@@ -161,8 +168,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Core Multiplexer Event Loop
     'outer: loop {
+        let mut pty_changed = false;
+
         if TERMINAL_RESIZED.swap(false, Ordering::Relaxed) {
             sync_terminal_size(&child.master);
+
+            // Update the virtual grid to match the new physical window bounds
+            let mut new_size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+            unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut new_size); }
+
+            let pty_rows = if new_size.ws_row > 1 { new_size.ws_row - 1 } else { new_size.ws_row };
+            vt_parser.screen_mut().set_size(pty_rows, new_size.ws_col);
+            pty_changed = true; // Force redraw on window resizing
         }
 
         events.clear();
@@ -173,13 +190,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
 
+
         for ev in events.iter() {
             match ev.key {
                 0 => {
-                    if !handle_pty_data(&child.master, &mut stdout_lock, &mut buffer)? {
+                    if !handle_pty_data(&child.master, &mut vt_parser, &mut buffer)? {
                         break 'outer;
                     }
                     poller.modify(&child.master, Event::readable(0))?;
+                    pty_changed = true; // Mark that the virtual screen state updated
                 }
                 1 => {
                     if !handle_stdin_data(&mut stdin_lock, &child.master, &mut buffer) {
@@ -189,6 +208,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => {}
             }
+        }
+
+        // Draw Frame Layer (Compositor composition)
+        if pty_changed {
+            let screen_contents = vt_parser.screen().contents_formatted();
+
+            // Render Step A: Draw the virtual guest terminal layer from home (1,1)
+            let _ = stdout_lock.write_all(b"\x1b[H");
+            let _ = write_stdout_blocking(&mut stdout_lock, &screen_contents);
+
+            // Fetch host dimensions to pinpoint the physical window's absolute bottom edge
+            let mut host_size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+            unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut host_size); }
+
+            // Render Step B: Snap the cursor to column 1 of our reserved bottom row
+            let move_to_bottom = format!("\x1b[{};1H", host_size.ws_row);
+            let _ = stdout_lock.write_all(move_to_bottom.as_bytes());
+
+            // Render Step C: Paint the styled status bar
+            // (\x1b[7m triggers inverted colors, \x1b[K clears the rest of the line, \x1b[0m resets attributes)
+            let status_text = format!(
+                "\x1b[48;5;236m\x1b[38;5;255m 🦀 RUST-MUX | Window 0 (bash) | Terminal Grid: {}x{} \x1b[K\x1b[0m",
+                host_size.ws_row, host_size.ws_col
+            );
+            let _ = stdout_lock.write_all(status_text.as_bytes());
+
+            // Render Step D: Put the hardware cursor back to its correct active input position
+            // Note: vt100 coordinates are 0-indexed; ANSI escape sequences are 1-indexed.
+            let (v_row, v_col) = vt_parser.screen().cursor_position();
+            let restore_cursor = format!("\x1b[{};{}H", v_row + 1, v_col + 1);
+            let _ = stdout_lock.write_all(restore_cursor.as_bytes());
+
+            let _ = stdout_lock.flush();
         }
     }
 
