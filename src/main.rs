@@ -422,11 +422,7 @@ fn flush_stdout_blocking(stdout: &mut StdoutLock) -> Result<(), Box<dyn std::err
 }
 
 fn main() {
-    run_app().unwrap();
-}
-
-fn run_app() -> Result<(), Box<dyn std::error::Error>> {
-    setup_sigwinch_handler()?;
+    setup_sigwinch_handler().expect("Failed to setup SIGWINCH handler");
 
     let stdin_handle = stdin();
     let orig_flags = fcntl(&stdin_handle, FcntlArg::F_GETFL)?;
@@ -444,6 +440,4 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Application initialization and event execution loop
     let mut app = MuxApp::new()?;
     app.run(&mut stdin_lock, &mut stdout_lock)?;
-
-    Ok(())
 }
