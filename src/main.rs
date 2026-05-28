@@ -59,7 +59,8 @@ impl MuxApp {
         unsafe {
             self.poller.add(&*stdin_lock, Event::readable(0))?;
             if !self.windows.is_empty() {
-                self.poller.add(&self.windows[0].master, Event::readable(1))?;
+                self.poller
+                    .add(&self.windows[0].master, Event::readable(1))?;
             }
         }
 
@@ -182,8 +183,7 @@ impl MuxApp {
         }
 
         if win_idx < self.windows.len() {
-            self
-                .poller
+            self.poller
                 .modify(&self.windows[win_idx].master, Event::readable(win_idx + 1))?;
         }
 
@@ -205,8 +205,7 @@ impl MuxApp {
         let new_win = spawn_window(active_rows, host_size.ws_col)?;
         let next_token = 1 + self.windows.len();
         unsafe {
-            self
-                .poller
+            self.poller
                 .add(&new_win.master, Event::readable(next_token))?;
         }
         self.windows.push(new_win);
@@ -247,7 +246,10 @@ impl MuxApp {
         }
     }
 
-    fn draw_interface(&self, stdout_lock: &mut StdoutLock) -> Result<(), Box<dyn std::error::Error>> {
+    fn draw_interface(
+        &self,
+        stdout_lock: &mut StdoutLock,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let screen_contents = self.windows[self.current_window_idx]
             .parser
             .screen()
@@ -262,10 +264,7 @@ impl MuxApp {
         // 3. Render status bar position safely
         let host_size = get_terminal_size();
         let move_to_bottom = format!("\x1b[{};1H", host_size.ws_row);
-        write_stdout_blocking(
-            stdout_lock,
-            move_to_bottom.as_bytes()
-        )?;
+        write_stdout_blocking(stdout_lock, move_to_bottom.as_bytes())?;
 
         let mut dynamic_tabs = String::new();
         for (idx, _) in self.windows.iter().enumerate() {
@@ -297,10 +296,7 @@ impl MuxApp {
             .screen()
             .cursor_position();
         let restore_cursor = format!("\x1b[{};{}H", v_row + 1, v_col + 1);
-        write_stdout_blocking(
-            stdout_lock,
-            restore_cursor.as_bytes()
-        )?;
+        write_stdout_blocking(stdout_lock, restore_cursor.as_bytes())?;
 
         // 5. Final flush wrapped in a safe loop
         flush_stdout_blocking(stdout_lock)?;
@@ -362,8 +358,8 @@ fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Erro
                 let native_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
                 // Convert to CString, falling back to basic "/bin/sh" if a null byte sneaks in
-                let shell = CString::new(native_shell)
-                    .unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
+                let shell =
+                    CString::new(native_shell).unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
 
                 let args = [shell.clone()];
                 let _ = execvp(&shell, &args);
@@ -383,6 +379,8 @@ fn sync_terminal_size(master: &impl AsRawFd) {
     }
 }
 
+// --- IO utilities --- //
+
 fn set_nonblocking(fd: &impl AsFd) -> Result<(), Box<dyn std::error::Error>> {
     let flags = fcntl(fd, FcntlArg::F_GETFL)?;
     let mut oflags = OFlag::from_bits_truncate(flags);
@@ -391,16 +389,17 @@ fn set_nonblocking(fd: &impl AsFd) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write_stdout_blocking(stdout: &mut StdoutLock, mut data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+fn write_stdout_blocking(
+    stdout: &mut StdoutLock,
+    mut data: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     while !data.is_empty() {
         match stdout.write(data) {
             Ok(0) => {
-                let err = std::io::Error::new(
-                    std::io::ErrorKind::WriteZero, 
-                    "failed to write to stdout"
-                );
+                let err =
+                    std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write to stdout");
                 return Err(err.into());
-            },
+            }
             Ok(n) => data = &data[n..],
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -421,23 +420,27 @@ fn flush_stdout_blocking(stdout: &mut StdoutLock) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+// --- main application --- //
+
 fn main() {
-    setup_sigwinch_handler().expect("Failed to setup SIGWINCH handler");
+    setup_sigwinch_handler().expect("Failed to set up resize handler");
+
+    enable_raw_mode().expect("Failed to enable raw mode");
+    defer! { disable_raw_mode().expect("Failed to restore terminal mode"); }
 
     let stdin_handle = stdin();
-    let orig_flags = fcntl(&stdin_handle, FcntlArg::F_GETFL)?;
+
+    let orig_flags = fcntl(&stdin_handle, FcntlArg::F_GETFL).expect("Failed to read stdin flags");
     defer! {
-        let _ = fcntl(&stdin_handle, FcntlArg::F_SETFL(OFlag::from_bits_truncate(orig_flags)));
+        fcntl(&stdin_handle, FcntlArg::F_SETFL(OFlag::from_bits_truncate(orig_flags)))
+            .expect("Failed to reset stdin flags");
     }
 
-    set_nonblocking(&stdin_handle)?;
-    enable_raw_mode()?;
-    defer! { let _ = disable_raw_mode(); }
+    set_nonblocking(&stdin_handle).expect("Failed to enable non-blocking IO");
 
     let mut stdin_lock = stdin_handle.lock();
     let mut stdout_lock = stdout().lock();
 
-    // Application initialization and event execution loop
-    let mut app = MuxApp::new()?;
-    app.run(&mut stdin_lock, &mut stdout_lock)?;
+    let mut app = MuxApp::new().unwrap();
+    app.run(&mut stdin_lock, &mut stdout_lock).unwrap();
 }
