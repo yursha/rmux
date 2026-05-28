@@ -264,6 +264,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmux"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "libc",
+ "nix",
+ "polling",
+ "scopeguard",
+ "vt100",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -343,18 +355,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tmuxrs"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "libc",
- "nix",
- "polling",
- "scopeguard",
- "vt100",
 ]
 
 [[package]]

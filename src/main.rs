@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::io::{stdin, stdout, Read, Write, StdinLock, StdoutLock};
+use std::io::{stdin, stdout, StdinLock, StdoutLock, Write};
 use std::num::NonZero;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,12 +12,18 @@ use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal
 use nix::unistd::execvp;
 use polling::{Event, Events, Poller};
 use scopeguard::defer;
+use std::panic;
 
-// Global flag modified during an OS signal interruption (SIGWINCH)
 static TERMINAL_RESIZED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigwinch(_signal: libc::c_int) {
     TERMINAL_RESIZED.store(true, Ordering::Relaxed);
+}
+
+enum LoopAction {
+    Continue,
+    Redraw,
+    Exit,
 }
 
 struct Window {
@@ -25,23 +31,405 @@ struct Window {
     parser: vt100::Parser,
 }
 
-pub struct PtyChild {
-    pub master: OwnedFd,
-    pub pid: nix::unistd::Pid,
+struct MuxApp {
+    windows: Vec<Window>,
+    current_window_idx: usize,
+    prefix_mode: bool,
+    poller: Poller,
 }
 
-impl PtyChild {
-    pub fn spawn_bash() -> Result<Self, Box<dyn std::error::Error>> {
-        let res = unsafe { forkpty(None, None)? };
-        match res {
-            ForkptyResult::Parent { child, master } => Ok(PtyChild { master, pid: child }),
-            ForkptyResult::Child => {
-                let bash = CString::new("bash")?;
-                execvp(&bash, &[&bash])?;
-                std::process::exit(1);
-            }
+pub struct ContextError {
+    pub error: String, // Store the rendered error string directly
+    pub file: &'static str,
+    pub line: u32,
+}
+
+impl ContextError {
+    pub fn new(msg: &str, file: &'static str, line: u32) -> Self {
+        Self {
+            error: msg.to_string(),
+            file,
+            line,
         }
     }
+}
+
+impl std::fmt::Display for ContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Runtime Error: '{}' at {}:line {}",
+            self.error, self.file, self.line
+        )
+    }
+}
+
+impl std::fmt::Debug for ContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ContextError {{ error: {:?}, file: '{}', line: {} }}",
+            self.error, self.file, self.line
+        )
+    }
+}
+
+impl std::error::Error for ContextError {}
+
+// The unified macro now works flawlessly on absolutely everything
+#[macro_export]
+macro_rules! wrap {
+    ($expr:expr) => {
+        $expr.map_err(|e| ContextError {
+            error: e.to_string(), // Captures the error text immediately
+            file: file!(),
+            line: line!(),
+        })?
+    };
+}
+
+pub type AppResult<T> = Result<T, ContextError>;
+
+fn setup_panic_hook() {
+    panic::set_hook(Box::new(|panic_info| {
+        // 1. CRITICAL: Force the terminal out of raw mode / alternate screen
+        // adjustments so the panic message is actually visible.
+        // Adjust these control codes based on what your app uses to initialize.
+        let _ = stdout().write_all(b"\x1b[?1049l"); // Exit alternate screen
+        let _ = stdout().write_all(b"\x1b[?25h"); // Show cursor
+        let _ = stdout().flush();
+
+        // If you are using a crate like crossterm, use this instead:
+        // let _ = crossterm::terminal::disable_raw_mode();
+
+        // 2. Print the crash context cleanly
+        eprintln!("\n====================================================");
+        eprintln!("🚨 APPLICATION PANIC (CRASH) DETECTED");
+        eprintln!("====================================================");
+
+        if let Some(location) = panic_info.location() {
+            eprintln!(
+                "📍 Location: {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
+        }
+
+        if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            eprintln!("💬 Message: {}", s);
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            eprintln!("💬 Message: {}", s);
+        } else {
+            eprintln!("💬 Message: Unknown panic payload.");
+        }
+
+        eprintln!("====================================================\n");
+    }));
+}
+
+impl MuxApp {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let poller = wrap!(Poller::new());
+        let physical_size = get_terminal_size();
+        let pty_rows = if physical_size.ws_row > 1 {
+            physical_size.ws_row - 1
+        } else {
+            physical_size.ws_row
+        };
+        let first_window = wrap!(spawn_window(pty_rows, physical_size.ws_col));
+
+        Ok(Self {
+            windows: vec![first_window],
+            current_window_idx: 0,
+            prefix_mode: false,
+            poller,
+        })
+    }
+
+    fn run(
+        &mut self,
+        stdin_lock: &mut StdinLock,
+        stdout_lock: &mut StdoutLock,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Register initial poll handles
+        unsafe {
+            wrap!(self.poller.add(&*stdin_lock, Event::readable(0)));
+            if !self.windows.is_empty() {
+                wrap!(self.poller.add(&self.windows[0].master, Event::readable(1)));
+            }
+        }
+
+        let mut events = Events::with_capacity(NonZero::new(10).unwrap());
+        wrap!(self.draw_interface(stdout_lock));
+
+        'outer: loop {
+            let mut pty_changed = false;
+
+            if TERMINAL_RESIZED.swap(false, Ordering::Relaxed) {
+                self.handle_terminal_resize();
+                pty_changed = true;
+            }
+
+            events.clear();
+            if let Err(e) = self
+                .poller
+                .wait(&mut events, Some(Duration::from_millis(15)))
+            {
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e.into());
+            }
+
+            for ev in events.iter() {
+                let action = match ev.key {
+                    0 => wrap!(self.handle_stdin(stdin_lock)),
+                    _ => wrap!(self.handle_pty(ev.key - 1)),
+                };
+
+                match action {
+                    LoopAction::Exit => break 'outer,
+                    LoopAction::Redraw => pty_changed = true,
+                    LoopAction::Continue => {}
+                }
+            }
+
+            if pty_changed {
+                wrap!(self.draw_interface(stdout_lock));
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_stdin(
+        &mut self,
+        stdin_lock: &mut StdinLock,
+    ) -> Result<LoopAction, Box<dyn std::error::Error>> {
+        let mut stdin_buffer = [0u8; 128];
+        let mut action = LoopAction::Continue;
+
+        if let Ok(n) = std::io::Read::read(stdin_lock, &mut stdin_buffer) {
+            if n == 0 {
+                return Ok(LoopAction::Exit);
+            }
+
+            for &byte in &stdin_buffer[..n] {
+                if self.prefix_mode {
+                    self.prefix_mode = false;
+                    action = LoopAction::Redraw;
+                    match byte {
+                        b'c' => wrap!(self.spawn_new_window()),
+                        b'n' => {
+                            self.current_window_idx =
+                                (self.current_window_idx + 1) % self.windows.len()
+                        }
+                        b'p' => {
+                            self.current_window_idx = (self.current_window_idx + self.windows.len()
+                                - 1)
+                                % self.windows.len()
+                        }
+                        0x02 => {
+                            let _ = nix::unistd::write(
+                                &self.windows[self.current_window_idx].master,
+                                &[0x02],
+                            );
+                        }
+                        _ => {}
+                    }
+                } else if byte == 0x02 {
+                    self.prefix_mode = true;
+                    action = LoopAction::Redraw;
+                } else {
+                    let _ =
+                        nix::unistd::write(&self.windows[self.current_window_idx].master, &[byte]);
+                }
+            }
+        }
+        wrap!(self.poller.modify(&*stdin_lock, Event::readable(0)));
+        Ok(action)
+    }
+
+    fn handle_pty(&mut self, win_idx: usize) -> Result<LoopAction, Box<dyn std::error::Error>> {
+        if win_idx >= self.windows.len() {
+            return Ok(LoopAction::Continue);
+        }
+
+        let mut pty_buffer = [0u8; 4096];
+        let mut pty_changed = false;
+
+        loop {
+            match nix::unistd::read(&self.windows[win_idx].master, &mut pty_buffer) {
+                Ok(0) | Err(nix::errno::Errno::EIO) => {
+                    if self.close_window(win_idx) {
+                        return Ok(LoopAction::Exit);
+                    }
+                    return Ok(LoopAction::Redraw);
+                }
+                Ok(n) => {
+                    self.windows[win_idx].parser.process(&pty_buffer[..n]);
+                    if win_idx == self.current_window_idx {
+                        pty_changed = true;
+                    }
+                }
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(_) => break,
+            }
+        }
+
+        if win_idx < self.windows.len() {
+            wrap!(self
+                .poller
+                .modify(&self.windows[win_idx].master, Event::readable(win_idx + 1)));
+        }
+
+        Ok(if pty_changed {
+            LoopAction::Redraw
+        } else {
+            LoopAction::Continue
+        })
+    }
+
+    fn spawn_new_window(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let host_size = get_terminal_size();
+        let active_rows = if host_size.ws_row > 1 {
+            host_size.ws_row - 1
+        } else {
+            host_size.ws_row
+        };
+
+        let new_win = wrap!(spawn_window(active_rows, host_size.ws_col));
+        let next_token = 1 + self.windows.len();
+        unsafe {
+            wrap!(self
+                .poller
+                .add(&new_win.master, Event::readable(next_token)));
+        }
+        self.windows.push(new_win);
+        self.current_window_idx = self.windows.len() - 1;
+        Ok(())
+    }
+
+    fn close_window(&mut self, win_idx: usize) -> bool {
+        let closed_win = self.windows.remove(win_idx);
+        let _ = self.poller.delete(&closed_win.master);
+
+        if self.windows.is_empty() {
+            return true;
+        }
+
+        for (idx, win) in self.windows.iter().enumerate() {
+            let _ = self.poller.modify(&win.master, Event::readable(idx + 1));
+        }
+
+        if self.current_window_idx >= self.windows.len() {
+            self.current_window_idx = self.windows.len() - 1;
+        }
+
+        false
+    }
+
+    fn handle_terminal_resize(&mut self) {
+        sync_terminal_size(&self.windows[self.current_window_idx].master);
+        let new_size = get_terminal_size();
+
+        let pty_rows = if new_size.ws_row > 1 {
+            new_size.ws_row - 1
+        } else {
+            new_size.ws_row
+        };
+        for win in &mut self.windows {
+            win.parser.screen_mut().set_size(pty_rows, new_size.ws_col);
+        }
+    }
+
+    fn draw_interface(&self, stdout_lock: &mut StdoutLock) -> AppResult<()> {
+        let screen_contents = self.windows[self.current_window_idx]
+            .parser
+            .screen()
+            .contents_formatted();
+
+        // 1. Move cursor home safely
+        wrap!(write_stdout_blocking(stdout_lock, b"\x1b[H"));
+
+        // 2. Write virtual terminal screen safely
+        wrap!(write_stdout_blocking(stdout_lock, &screen_contents));
+
+        // 3. Render status bar position safely
+        let host_size = get_terminal_size();
+        let move_to_bottom = format!("\x1b[{};1H", host_size.ws_row);
+        wrap!(write_stdout_blocking(
+            stdout_lock,
+            move_to_bottom.as_bytes()
+        ));
+
+        let mut dynamic_tabs = String::new();
+        for (idx, _) in self.windows.iter().enumerate() {
+            if idx == self.current_window_idx {
+                dynamic_tabs.push_str(&format!(
+                    " \x1b[48;5;240m\x1b[38;5;255m {}:bash* \x1b[48;5;236m",
+                    idx
+                ));
+            } else {
+                dynamic_tabs.push_str(&format!(" {}:bash ", idx));
+            }
+        }
+
+        let prefix_badge = if self.prefix_mode {
+            " \x1b[48;5;160m\x1b[38;5;255m [PREFIX] \x1b[48;5;236m"
+        } else {
+            ""
+        };
+
+        let status_text = format!(
+            "\x1b[48;5;236m\x1b[38;5;255m 🦀 RUST-MUX |{} Tabs:{} | Grid: {}x{} \x1b[K\x1b[0m",
+            prefix_badge, dynamic_tabs, host_size.ws_row, host_size.ws_col
+        );
+        wrap!(write_stdout_blocking(stdout_lock, status_text.as_bytes()));
+
+        // 4. Restore the cursor to its layout position safely
+        let (v_row, v_col) = self.windows[self.current_window_idx]
+            .parser
+            .screen()
+            .cursor_position();
+        let restore_cursor = format!("\x1b[{};{}H", v_row + 1, v_col + 1);
+        wrap!(write_stdout_blocking(
+            stdout_lock,
+            restore_cursor.as_bytes()
+        ));
+
+        // 5. Final flush wrapped in a safe loop
+        wrap!(flush_stdout_blocking(stdout_lock));
+        Ok(())
+    }
+}
+
+// --- Independent Lower-Level Helper Functions ---
+
+fn get_terminal_size() -> libc::winsize {
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws);
+    }
+    ws
+}
+
+fn setup_sigwinch_handler() -> Result<(), Box<dyn std::error::Error>> {
+    let sigwinch_action = SigAction::new(
+        SigHandler::Handler(handle_sigwinch),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    unsafe {
+        wrap!(sigaction(Signal::SIGWINCH, &sigwinch_action));
+    }
+    Ok(())
 }
 
 fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Error>> {
@@ -53,336 +441,114 @@ fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Erro
     };
 
     unsafe {
-        match nix::pty::forkpty(Some(&ws), None)? {
-            nix::pty::ForkptyResult::Parent { child: _, master } => {
-                // safeguard from blocking on the PTY streams
+        match wrap!(forkpty(Some(&ws), None)) {
+            ForkptyResult::Parent { child: _, master } => {
                 let _ = set_nonblocking(&master);
-
                 let parser = vt100::Parser::new(rows, cols, 0);
                 Ok(Window { master, parser })
             }
-            nix::pty::ForkptyResult::Child => {
-                // Drop the child process directly into a pristine shell
-                let shell = std::ffi::CString::new("/bin/bash").unwrap();
+            ForkptyResult::Child => {
+                let shell = CString::new("/bin/bash").unwrap();
                 let args = [shell.clone()];
-                let _ = nix::unistd::execvp(&shell, &args);
+                let _ = execvp(&shell, &args);
                 std::process::exit(1);
             }
         }
     }
 }
 
-/// Grabs the physical dimensions of the host window and applies them to the PTY.
 fn sync_terminal_size(master: &impl AsRawFd) {
-    let mut ws = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
+    let mut ws = get_terminal_size();
+    if ws.ws_row > 1 {
+        ws.ws_row -= 1;
+    }
     unsafe {
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
-            // Subtract 1 row to reserve space for our persistent status bar!
-            if ws.ws_row > 1 {
-                ws.ws_row -= 1;
-            }
-            libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
-        }
+        libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &mut ws);
     }
 }
 
-/// Configures a file descriptor to operate in non-blocking mode.
 fn set_nonblocking(fd: &impl AsFd) -> Result<(), Box<dyn std::error::Error>> {
-    let flags = fcntl(fd, FcntlArg::F_GETFL)?;
+    let flags = wrap!(fcntl(fd, FcntlArg::F_GETFL));
     let mut oflags = OFlag::from_bits_truncate(flags);
     oflags.insert(OFlag::O_NONBLOCK);
-    fcntl(fd, FcntlArg::F_SETFL(oflags))?;
+    wrap!(fcntl(fd, FcntlArg::F_SETFL(oflags)));
     Ok(())
 }
 
-/// Explicitly handles writing to a non-blocking stdout by yielding when buffers fill up.
-fn write_stdout_blocking(stdout: &mut StdoutLock, mut data: &[u8]) -> std::io::Result<()> {
+fn write_stdout_blocking(stdout: &mut StdoutLock, mut data: &[u8]) -> AppResult<()> {
     while !data.is_empty() {
         match stdout.write(data) {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write to stdout")),
+            Ok(0) => {
+                return Err(ContextError::new(
+                    "failed to write to stdout (WriteZero)",
+                    file!(),
+                    line!(),
+                ))
+            }
             Ok(n) => data = &data[n..],
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
-            Err(e) => return Err(e),
-        }
-    }
-    while let Err(e) = stdout.flush() {
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            std::thread::yield_now();
-        } else {
-            return Err(e);
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(ContextError::new(&e.to_string(), file!(), line!())),
         }
     }
     Ok(())
 }
 
-/*
-/// Processes incoming target application text streaming out of the PTY master channel.
-fn handle_pty_data(master: &OwnedFd, parser: &mut vt100::Parser, buffer: &mut [u8]) -> Result<bool, Box<dyn std::error::Error>> {
-    match nix::unistd::read(master, buffer) {
-        Ok(0) => return Ok(false), // Clean EOF
-        Ok(n) => {
-            parser.process(&buffer[..n]);
-        }
-        Err(nix::errno::Errno::EAGAIN) => {}
-        Err(nix::errno::Errno::EIO) => return Ok(false), // Traditional Linux PTY session termination
-        Err(e) => {
-            eprintln!("\r\nPTY Error: {}\r\n", e);
-            return Ok(false);
+fn flush_stdout_blocking(stdout: &mut StdoutLock) -> AppResult<()> {
+    while let Err(e) = stdout.flush() {
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
+            std::io::ErrorKind::Interrupted => {}
+            _ => return Err(ContextError::new(&e.to_string(), file!(), line!())),
         }
     }
-    Ok(true)
+    Ok(())
 }
 
-/// Processes physical key presses captured from the user's host stdin terminal handle.
-fn handle_stdin_data(stdin: &mut StdinLock, master: &OwnedFd, buffer: &mut [u8]) -> bool {
-    match nix::unistd::read(stdin, buffer) {
-        Ok(0) => {}
-        Ok(n) if n > 0 => {
-            if let Err(e) = nix::unistd::write(master, &buffer[..n]) {
-                eprintln!("\r\nPTY Write Error: {}\r\n", e);
-                return false;
-            }
-        }
-        Ok(_) => {}
-        Err(nix::errno::Errno::EAGAIN) => {}
-        Err(e) => {
-            eprintln!("\r\nStdin Error: {}\r\n", e);
-            return false;
-        }
+// --- Entry Point ---
+
+fn main() {
+    // Step 1: Secure the panic behavior
+    setup_panic_hook();
+
+    // Step 2: Run the application architecture
+    if let Err(context_err) = run_app() {
+        // Step 3: Gracefully clean up terminal states before printing the error
+        let _ = stdout().write_all(b"\x1b[?1049l\x1b[?25h");
+        let _ = stdout().flush();
+
+        // Print the highly detailed error tracking breakdown
+        eprintln!("\n====================================================");
+        eprintln!("❌ RUNTIME ERROR DETECTED");
+        eprintln!("====================================================");
+        eprintln!("📍 Source File: {}", context_err.file);
+        eprintln!("🔢 Line Number: {}", context_err.line);
+        eprintln!("🛡️  Underlying OS Error: {}", context_err.error);
+        eprintln!("====================================================\n");
+
+        std::process::exit(1);
     }
-    true
 }
-*/
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up our multiplexer state trackers
-    let mut windows: Vec<Window> = Vec::new();
-    let mut current_window_idx: usize = 0;
-    let mut prefix_mode = false; // Tracks if Ctrl+B was just tapped
-                                 
-    
-    let mut physical_size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-    unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut physical_size); }
+fn run_app() -> AppResult<()> {
+    wrap!(setup_sigwinch_handler());
 
-    let sigwinch_action = SigAction::new(SigHandler::Handler(handle_sigwinch), SaFlags::empty(), SigSet::empty());
-    unsafe { sigaction(Signal::SIGWINCH, &sigwinch_action)?; }
-
-    // Allocate the virtual matrix grid using the isolated row count
-    let pty_rows = if physical_size.ws_row > 1 { physical_size.ws_row - 1 } else { physical_size.ws_row };
-    let first_window = spawn_window(pty_rows, physical_size.ws_col)?;
-
-    /*
-    let mut vt_parser = vt100::Parser::new(pty_rows, physical_size.ws_col, 0);
-    let child = PtyChild::spawn_bash().expect("Failed to spawn bash");
-    sync_terminal_size(&child.master);
-    */
-
-    // 2. High-Performance Locked I/O Initialization
     let stdin_handle = stdin();
-
-    // 3. Flags and State Fallbacks
-    let orig_flags = fcntl(&stdin_handle, FcntlArg::F_GETFL)?;
-    defer! { 
-        let _ = fcntl(&stdin_handle, FcntlArg::F_SETFL(OFlag::from_bits_truncate(orig_flags))); 
+    let orig_flags = wrap!(fcntl(&stdin_handle, FcntlArg::F_GETFL));
+    defer! {
+        let _ = fcntl(&stdin_handle, FcntlArg::F_SETFL(OFlag::from_bits_truncate(orig_flags)));
     }
 
-    set_nonblocking(&stdin_handle)?;
-
-    enable_raw_mode()?;
+    wrap!(set_nonblocking(&stdin_handle));
+    wrap!(enable_raw_mode());
     defer! { let _ = disable_raw_mode(); }
 
-    // Now instantiate your locks. They will co-exist peacefully with the handle borrows.
     let mut stdin_lock = stdin_handle.lock();
     let mut stdout_lock = stdout().lock();
 
-    // 4. Poller Registration
-    let poller = Poller::new()?;
-    unsafe {
-        poller.add(&stdin_lock, Event::readable(0))?;  // Token 1: Stdin
-        poller.add(&first_window.master, Event::readable(1))?; // Token 0: PTY
-    }
-    windows.push(first_window);
-
-    let mut events = Events::with_capacity(NonZero::new(10).unwrap());
-
-    // 5. Core Multiplexer Event Loop
-    'outer: loop {
-        let mut pty_changed = false;
-
-        if TERMINAL_RESIZED.swap(false, Ordering::Relaxed) {
-            sync_terminal_size(&windows[current_window_idx].master);
-
-            // Update the virtual grid to match the new physical window bounds
-            let mut new_size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-            unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut new_size); }
-
-            let pty_rows = if new_size.ws_row > 1 { new_size.ws_row - 1 } else { new_size.ws_row };
-            for win in &mut windows {
-                win.parser.screen_mut().set_size(pty_rows, new_size.ws_col);
-            }
-            pty_changed = true; // Force redraw on window resizing
-        }
-
-        events.clear();
-        if let Err(e) = poller.wait(&mut events, Some(Duration::from_millis(15))) {
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e.into());
-        }
-
-
-        for ev in events.iter() {
-            match ev.key {
-                0 => {
-                    let mut stdin_buffer = [0u8; 128];
-                    if let Ok(n) = stdin_lock.read(&mut stdin_buffer) {
-                        if n == 0 { break 'outer; }
-
-                        let mut i = 0;
-
-                        while i < n {
-                            let byte = stdin_buffer[i];
-
-                            if prefix_mode {
-                                prefix_mode = false; // Reset mode immediately upon processing command
-                                pty_changed = true; // Force redraw to clear the prefix badge
-                                match byte {
-                                    b'c' => { // Create a new window session
-                                        let mut host_size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-                                        unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut host_size); }
-                                        let active_rows = if host_size.ws_row > 1 { host_size.ws_row - 1 } else { host_size.ws_row };
-
-                                        if let Ok(new_win) = spawn_window(active_rows, host_size.ws_col) {
-                                            let next_token = 1 + windows.len();
-                                            unsafe { let _ = poller.add(&new_win.master, Event::readable(next_token)); }
-                                            windows.push(new_win);
-                                            current_window_idx = windows.len() - 1;
-                                        }
-                                    }
-                                    b'n' => { // Switch to Next Window
-                                        current_window_idx = (current_window_idx + 1) % windows.len();
-                                    }
-                                    b'p' => { // Switch to Previous Window
-                                        current_window_idx = (current_window_idx + windows.len() - 1) % windows.len();
-                                    }
-                                    0x02 => { // Send a literal Ctrl+B to the application by double-tapping it
-                                        let _ = nix::unistd::write(&windows[current_window_idx].master, &[0x02]);
-                                    }
-                                    _ => {} // Unmapped prefix key, sink silently
-                                }
-                            } else {
-                                if byte == 0x02 { // Caught raw Ctrl+B!
-                                    prefix_mode = true;
-                                    pty_changed = true; // Force immediate redraw to show [PREFIX] badge
-                                } else { // Normal execution pass-through to active window
-                                    let _ = nix::unistd::write(&windows[current_window_idx].master, &[byte]);
-                                }
-                            }
-                            i += 1;
-                        }
-                    }
-                    poller.modify(&stdin_lock, Event::readable(0))?;
-                }
-                _ => {
-                    let win_idx = ev.key - 1;
-                    if win_idx < windows.len() {
-                        let mut pty_buffer = [0u8; 4096];
-                        match nix::unistd::read(&windows[win_idx].master, &mut pty_buffer) {
-                            Ok(0) | Err(nix::errno::Errno::EIO) => {
-                                // 1. Remove the dead window from state and stop polling it
-                                let closed_win = windows.remove(win_idx);
-                                let _ = poller.delete(&closed_win.master);
-
-                                // 2. If that was the last open window, exit the entire program!
-                                if windows.is_empty() {
-                                    break 'outer;
-                                }
-
-                                // 3. Re-index remaining windows so their poller tokens align with their new vector indices
-                                for (idx, win) in windows.iter().enumerate() {
-                                    let _ = poller.modify(&win.master, Event::readable(idx + 1));
-                                }
-
-                                // 4. Safeguard our focus index so it doesn't point out-of-bounds
-                                if current_window_idx >= windows.len() {
-                                    current_window_idx = windows.len() - 1;
-                                }
-
-                                pty_changed = true;
-                                break;
-                            }
-                            Ok(n) => {
-                                // Update the specific window parser matrix, even if running in the background!
-                                windows[win_idx].parser.process(&pty_buffer[..n]);
-                                if win_idx == current_window_idx {
-                                    pty_changed = true; // Only flag viewport changes if it's our focused tab
-                                }
-                            }
-                            _ => {}
-                        }
-                        poller.modify(&windows[win_idx].master, Event::readable(ev.key))?;
-                    }
-                }
-            }
-        }
-
-        // Draw Frame Layer (Compositor composition)
-        if pty_changed {
-            let screen_contents = windows[current_window_idx].parser.screen().contents_formatted();
-
-            // Render Step A: Draw the virtual guest terminal layer from home (1,1)
-            let _ = stdout_lock.write_all(b"\x1b[H");
-            let _ = write_stdout_blocking(&mut stdout_lock, &screen_contents);
-
-            // Fetch host dimensions to pinpoint the physical window's absolute bottom edge
-            let mut host_size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-            unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut host_size); }
-
-            // Render Step B: Snap the cursor to column 1 of our reserved bottom row
-            let move_to_bottom = format!("\x1b[{};1H", host_size.ws_row);
-            let _ = stdout_lock.write_all(move_to_bottom.as_bytes());
-
-            // Render Step C: Paint the styled status bar
-            let mut dynamic_tabs = String::new();
-            for (idx, _) in windows.iter().enumerate() {
-                if idx == current_window_idx {
-                    // Highlight the active tab with a lighter background and an asterisk
-                    dynamic_tabs.push_str(&format!(" \x1b[48;5;240m\x1b[38;5;255m {}:bash* \x1b[48;5;236m", idx));
-                } else {
-                    // Regular dark background for background tabs
-                    dynamic_tabs.push_str(&format!(" {}:bash ", idx));
-                }
-            }
-
-            // Draw a bright red alert notice if tmux-style prefix mode is active
-            let prefix_badge = if prefix_mode {
-                " \x1b[48;5;160m\x1b[38;5;255m [PREFIX] \x1b[48;5;236m"
-            } else {
-                ""
-            };
-
-            let status_text = format!(
-                "\x1b[48;5;236m\x1b[38;5;255m 🦀 RUST-MUX |{} Tabs:{} | Grid: {}x{} \x1b[K\x1b[0m",
-                prefix_badge, dynamic_tabs, host_size.ws_row, host_size.ws_col
-            );
-
-            let _ = stdout_lock.write_all(status_text.as_bytes());
-
-            // Render Step D: Put the hardware cursor back to its correct active input position
-            // Note: vt100 coordinates are 0-indexed; ANSI escape sequences are 1-indexed.
-            let (v_row, v_col) = windows[current_window_idx].parser.screen().cursor_position();
-            let restore_cursor = format!("\x1b[{};{}H", v_row + 1, v_col + 1);
-            let _ = stdout_lock.write_all(restore_cursor.as_bytes());
-
-            let _ = stdout_lock.flush();
-        }
-    }
+    // Application initialization and event execution loop
+    let mut app = wrap!(MuxApp::new());
+    wrap!(app.run(&mut stdin_lock, &mut stdout_lock));
 
     Ok(())
 }
