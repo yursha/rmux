@@ -40,7 +40,10 @@ impl MuxApp {
         } else {
             physical_size.ws_row
         };
-        let first_window = spawn_window(pty_rows, physical_size.ws_col)?;
+        let first_window = Window {
+            master: spawn_pty(pty_rows, physical_size.ws_col)?,
+            parser: vt100::Parser::new(pty_rows, physical_size.ws_col, 0),
+        };
 
         Ok(Self {
             windows: vec![first_window],
@@ -202,7 +205,10 @@ impl MuxApp {
             host_size.ws_row
         };
 
-        let new_win = spawn_window(active_rows, host_size.ws_col)?;
+        let new_win = Window {
+            master: spawn_pty(active_rows, host_size.ws_col)?,
+            parser: vt100::Parser::new(active_rows, host_size.ws_col, 0),
+        };
         let next_token = 1 + self.windows.len();
         unsafe {
             self.poller
@@ -304,7 +310,9 @@ impl MuxApp {
     }
 }
 
-fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Error>> {
+// --- PTY forking --- //
+
+fn spawn_pty(rows: u16, cols: u16) -> Result<OwnedFd, Box<dyn std::error::Error>> {
     let ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
@@ -315,9 +323,8 @@ fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Erro
     unsafe {
         match forkpty(Some(&ws), None)? {
             ForkptyResult::Parent { child: _, master } => {
-                let _ = set_nonblocking(&master);
-                let parser = vt100::Parser::new(rows, cols, 0);
-                Ok(Window { master, parser })
+                set_nonblocking(&master)?;
+                Ok(master)
             }
             ForkptyResult::Child => {
                 let native_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -367,13 +374,13 @@ fn get_terminal_size() -> libc::winsize {
     ws
 }
 
-fn sync_terminal_size(master: &impl AsRawFd) {
+fn sync_terminal_size(fd: &impl AsRawFd) {
     let mut ws = get_terminal_size();
     if ws.ws_row > 1 {
         ws.ws_row -= 1;
     }
     unsafe {
-        libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &mut ws);
+        libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &mut ws);
     }
 }
 
