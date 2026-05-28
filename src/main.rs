@@ -304,41 +304,6 @@ impl MuxApp {
     }
 }
 
-// --- Independent Lower-Level Helper Functions ---
-
-fn get_terminal_size() -> libc::winsize {
-    let mut ws = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    unsafe {
-        libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws);
-    }
-    ws
-}
-
-// --- Terminal window change handler --- //
-
-static TERMINAL_RESIZED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_sigwinch(_signal: libc::c_int) {
-    TERMINAL_RESIZED.store(true, Ordering::Relaxed);
-}
-
-fn setup_sigwinch_handler() -> Result<(), Box<dyn std::error::Error>> {
-    let sigwinch_action = SigAction::new(
-        SigHandler::Handler(handle_sigwinch),
-        SaFlags::SA_RESTART,
-        SigSet::empty(),
-    );
-    unsafe {
-        sigaction(Signal::SIGWINCH, &sigwinch_action)?;
-    }
-    Ok(())
-}
-
 fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Error>> {
     let ws = libc::winsize {
         ws_row: rows,
@@ -367,6 +332,39 @@ fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Erro
             }
         }
     }
+}
+
+// --- Terminal window size utilities --- //
+
+static TERMINAL_RESIZED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigwinch(_signal: libc::c_int) {
+    TERMINAL_RESIZED.store(true, Ordering::Relaxed);
+}
+
+fn setup_sigwinch_handler() -> Result<(), Box<dyn std::error::Error>> {
+    let sigwinch_action = SigAction::new(
+        SigHandler::Handler(handle_sigwinch),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    unsafe {
+        sigaction(Signal::SIGWINCH, &sigwinch_action)?;
+    }
+    Ok(())
+}
+
+fn get_terminal_size() -> libc::winsize {
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws);
+    }
+    ws
 }
 
 fn sync_terminal_size(master: &impl AsRawFd) {
@@ -420,7 +418,7 @@ fn flush_stdout_blocking(stdout: &mut StdoutLock) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-// --- main application --- //
+// --- main --- //
 
 fn main() {
     setup_sigwinch_handler().expect("Failed to set up resize handler");
