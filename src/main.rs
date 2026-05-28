@@ -12,13 +12,6 @@ use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal
 use nix::unistd::execvp;
 use polling::{Event, Events, Poller};
 use scopeguard::defer;
-use std::panic;
-
-static TERMINAL_RESIZED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_sigwinch(_signal: libc::c_int) {
-    TERMINAL_RESIZED.store(true, Ordering::Relaxed);
-}
 
 enum LoopAction {
     Continue,
@@ -38,106 +31,16 @@ struct MuxApp {
     poller: Poller,
 }
 
-pub struct ContextError {
-    pub error: String, // Store the rendered error string directly
-    pub file: &'static str,
-    pub line: u32,
-}
-
-impl ContextError {
-    pub fn new(msg: &str, file: &'static str, line: u32) -> Self {
-        Self {
-            error: msg.to_string(),
-            file,
-            line,
-        }
-    }
-}
-
-impl std::fmt::Display for ContextError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Runtime Error: '{}' at {}:line {}",
-            self.error, self.file, self.line
-        )
-    }
-}
-
-impl std::fmt::Debug for ContextError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ContextError {{ error: {:?}, file: '{}', line: {} }}",
-            self.error, self.file, self.line
-        )
-    }
-}
-
-impl std::error::Error for ContextError {}
-
-// The unified macro now works flawlessly on absolutely everything
-#[macro_export]
-macro_rules! wrap {
-    ($expr:expr) => {
-        $expr.map_err(|e| ContextError {
-            error: e.to_string(), // Captures the error text immediately
-            file: file!(),
-            line: line!(),
-        })?
-    };
-}
-
-pub type AppResult<T> = Result<T, ContextError>;
-
-fn setup_panic_hook() {
-    panic::set_hook(Box::new(|panic_info| {
-        // 1. CRITICAL: Force the terminal out of raw mode / alternate screen
-        // adjustments so the panic message is actually visible.
-        // Adjust these control codes based on what your app uses to initialize.
-        let _ = stdout().write_all(b"\x1b[?1049l"); // Exit alternate screen
-        let _ = stdout().write_all(b"\x1b[?25h"); // Show cursor
-        let _ = stdout().flush();
-
-        // If you are using a crate like crossterm, use this instead:
-        // let _ = crossterm::terminal::disable_raw_mode();
-
-        // 2. Print the crash context cleanly
-        eprintln!("\n====================================================");
-        eprintln!("🚨 APPLICATION PANIC (CRASH) DETECTED");
-        eprintln!("====================================================");
-
-        if let Some(location) = panic_info.location() {
-            eprintln!(
-                "📍 Location: {}:{}:{}",
-                location.file(),
-                location.line(),
-                location.column()
-            );
-        }
-
-        if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-            eprintln!("💬 Message: {}", s);
-        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-            eprintln!("💬 Message: {}", s);
-        } else {
-            eprintln!("💬 Message: Unknown panic payload.");
-        }
-
-        eprintln!("====================================================\n");
-    }));
-}
-
 impl MuxApp {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let poller = wrap!(Poller::new());
+        let poller = Poller::new()?;
         let physical_size = get_terminal_size();
         let pty_rows = if physical_size.ws_row > 1 {
             physical_size.ws_row - 1
         } else {
             physical_size.ws_row
         };
-        let first_window = wrap!(spawn_window(pty_rows, physical_size.ws_col));
+        let first_window = spawn_window(pty_rows, physical_size.ws_col)?;
 
         Ok(Self {
             windows: vec![first_window],
@@ -154,14 +57,14 @@ impl MuxApp {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Register initial poll handles
         unsafe {
-            wrap!(self.poller.add(&*stdin_lock, Event::readable(0)));
+            self.poller.add(&*stdin_lock, Event::readable(0))?;
             if !self.windows.is_empty() {
-                wrap!(self.poller.add(&self.windows[0].master, Event::readable(1)));
+                self.poller.add(&self.windows[0].master, Event::readable(1))?;
             }
         }
 
         let mut events = Events::with_capacity(NonZero::new(10).unwrap());
-        wrap!(self.draw_interface(stdout_lock));
+        self.draw_interface(stdout_lock)?;
 
         'outer: loop {
             let mut pty_changed = false;
@@ -184,8 +87,8 @@ impl MuxApp {
 
             for ev in events.iter() {
                 let action = match ev.key {
-                    0 => wrap!(self.handle_stdin(stdin_lock)),
-                    _ => wrap!(self.handle_pty(ev.key - 1)),
+                    0 => self.handle_stdin(stdin_lock)?,
+                    _ => self.handle_pty(ev.key - 1)?,
                 };
 
                 match action {
@@ -196,7 +99,7 @@ impl MuxApp {
             }
 
             if pty_changed {
-                wrap!(self.draw_interface(stdout_lock));
+                self.draw_interface(stdout_lock)?;
             }
         }
         Ok(())
@@ -219,7 +122,7 @@ impl MuxApp {
                     self.prefix_mode = false;
                     action = LoopAction::Redraw;
                     match byte {
-                        b'c' => wrap!(self.spawn_new_window()),
+                        b'c' => self.spawn_new_window()?,
                         b'n' => {
                             self.current_window_idx =
                                 (self.current_window_idx + 1) % self.windows.len()
@@ -246,7 +149,7 @@ impl MuxApp {
                 }
             }
         }
-        wrap!(self.poller.modify(&*stdin_lock, Event::readable(0)));
+        self.poller.modify(&*stdin_lock, Event::readable(0))?;
         Ok(action)
     }
 
@@ -279,9 +182,9 @@ impl MuxApp {
         }
 
         if win_idx < self.windows.len() {
-            wrap!(self
+            self
                 .poller
-                .modify(&self.windows[win_idx].master, Event::readable(win_idx + 1)));
+                .modify(&self.windows[win_idx].master, Event::readable(win_idx + 1))?;
         }
 
         Ok(if pty_changed {
@@ -299,12 +202,12 @@ impl MuxApp {
             host_size.ws_row
         };
 
-        let new_win = wrap!(spawn_window(active_rows, host_size.ws_col));
+        let new_win = spawn_window(active_rows, host_size.ws_col)?;
         let next_token = 1 + self.windows.len();
         unsafe {
-            wrap!(self
+            self
                 .poller
-                .add(&new_win.master, Event::readable(next_token)));
+                .add(&new_win.master, Event::readable(next_token))?;
         }
         self.windows.push(new_win);
         self.current_window_idx = self.windows.len() - 1;
@@ -344,25 +247,25 @@ impl MuxApp {
         }
     }
 
-    fn draw_interface(&self, stdout_lock: &mut StdoutLock) -> AppResult<()> {
+    fn draw_interface(&self, stdout_lock: &mut StdoutLock) -> Result<(), Box<dyn std::error::Error>> {
         let screen_contents = self.windows[self.current_window_idx]
             .parser
             .screen()
             .contents_formatted();
 
         // 1. Move cursor home safely
-        wrap!(write_stdout_blocking(stdout_lock, b"\x1b[H"));
+        write_stdout_blocking(stdout_lock, b"\x1b[H")?;
 
         // 2. Write virtual terminal screen safely
-        wrap!(write_stdout_blocking(stdout_lock, &screen_contents));
+        write_stdout_blocking(stdout_lock, &screen_contents)?;
 
         // 3. Render status bar position safely
         let host_size = get_terminal_size();
         let move_to_bottom = format!("\x1b[{};1H", host_size.ws_row);
-        wrap!(write_stdout_blocking(
+        write_stdout_blocking(
             stdout_lock,
             move_to_bottom.as_bytes()
-        ));
+        )?;
 
         let mut dynamic_tabs = String::new();
         for (idx, _) in self.windows.iter().enumerate() {
@@ -386,7 +289,7 @@ impl MuxApp {
             "\x1b[48;5;236m\x1b[38;5;255m 🦀 RUST-MUX |{} Tabs:{} | Grid: {}x{} \x1b[K\x1b[0m",
             prefix_badge, dynamic_tabs, host_size.ws_row, host_size.ws_col
         );
-        wrap!(write_stdout_blocking(stdout_lock, status_text.as_bytes()));
+        write_stdout_blocking(stdout_lock, status_text.as_bytes())?;
 
         // 4. Restore the cursor to its layout position safely
         let (v_row, v_col) = self.windows[self.current_window_idx]
@@ -394,13 +297,13 @@ impl MuxApp {
             .screen()
             .cursor_position();
         let restore_cursor = format!("\x1b[{};{}H", v_row + 1, v_col + 1);
-        wrap!(write_stdout_blocking(
+        write_stdout_blocking(
             stdout_lock,
             restore_cursor.as_bytes()
-        ));
+        )?;
 
         // 5. Final flush wrapped in a safe loop
-        wrap!(flush_stdout_blocking(stdout_lock));
+        flush_stdout_blocking(stdout_lock)?;
         Ok(())
     }
 }
@@ -420,6 +323,14 @@ fn get_terminal_size() -> libc::winsize {
     ws
 }
 
+// --- Terminal window change handler --- //
+
+static TERMINAL_RESIZED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigwinch(_signal: libc::c_int) {
+    TERMINAL_RESIZED.store(true, Ordering::Relaxed);
+}
+
 fn setup_sigwinch_handler() -> Result<(), Box<dyn std::error::Error>> {
     let sigwinch_action = SigAction::new(
         SigHandler::Handler(handle_sigwinch),
@@ -427,7 +338,7 @@ fn setup_sigwinch_handler() -> Result<(), Box<dyn std::error::Error>> {
         SigSet::empty(),
     );
     unsafe {
-        wrap!(sigaction(Signal::SIGWINCH, &sigwinch_action));
+        sigaction(Signal::SIGWINCH, &sigwinch_action)?;
     }
     Ok(())
 }
@@ -441,7 +352,7 @@ fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Erro
     };
 
     unsafe {
-        match wrap!(forkpty(Some(&ws), None)) {
+        match forkpty(Some(&ws), None)? {
             ForkptyResult::Parent { child: _, master } => {
                 let _ = set_nonblocking(&master);
                 let parser = vt100::Parser::new(rows, cols, 0);
@@ -473,87 +384,66 @@ fn sync_terminal_size(master: &impl AsRawFd) {
 }
 
 fn set_nonblocking(fd: &impl AsFd) -> Result<(), Box<dyn std::error::Error>> {
-    let flags = wrap!(fcntl(fd, FcntlArg::F_GETFL));
+    let flags = fcntl(fd, FcntlArg::F_GETFL)?;
     let mut oflags = OFlag::from_bits_truncate(flags);
     oflags.insert(OFlag::O_NONBLOCK);
-    wrap!(fcntl(fd, FcntlArg::F_SETFL(oflags)));
+    fcntl(fd, FcntlArg::F_SETFL(oflags))?;
     Ok(())
 }
 
-fn write_stdout_blocking(stdout: &mut StdoutLock, mut data: &[u8]) -> AppResult<()> {
+fn write_stdout_blocking(stdout: &mut StdoutLock, mut data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     while !data.is_empty() {
         match stdout.write(data) {
             Ok(0) => {
-                return Err(ContextError::new(
-                    "failed to write to stdout (WriteZero)",
-                    file!(),
-                    line!(),
-                ))
-            }
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::WriteZero, 
+                    "failed to write to stdout"
+                );
+                return Err(err.into());
+            },
             Ok(n) => data = &data[n..],
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(ContextError::new(&e.to_string(), file!(), line!())),
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
 }
 
-fn flush_stdout_blocking(stdout: &mut StdoutLock) -> AppResult<()> {
+fn flush_stdout_blocking(stdout: &mut StdoutLock) -> Result<(), Box<dyn std::error::Error>> {
     while let Err(e) = stdout.flush() {
         match e.kind() {
             std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
             std::io::ErrorKind::Interrupted => {}
-            _ => return Err(ContextError::new(&e.to_string(), file!(), line!())),
+            _ => return Err(e.into()),
         }
     }
     Ok(())
 }
 
-// --- Entry Point ---
-
 fn main() {
-    // Step 1: Secure the panic behavior
-    setup_panic_hook();
-
-    // Step 2: Run the application architecture
-    if let Err(context_err) = run_app() {
-        // Step 3: Gracefully clean up terminal states before printing the error
-        let _ = stdout().write_all(b"\x1b[?1049l\x1b[?25h");
-        let _ = stdout().flush();
-
-        // Print the highly detailed error tracking breakdown
-        eprintln!("\n====================================================");
-        eprintln!("❌ RUNTIME ERROR DETECTED");
-        eprintln!("====================================================");
-        eprintln!("📍 Source File: {}", context_err.file);
-        eprintln!("🔢 Line Number: {}", context_err.line);
-        eprintln!("🛡️  Underlying OS Error: {}", context_err.error);
-        eprintln!("====================================================\n");
-
-        std::process::exit(1);
-    }
+    run_app().unwrap();
 }
 
-fn run_app() -> AppResult<()> {
-    wrap!(setup_sigwinch_handler());
+fn run_app() -> Result<(), Box<dyn std::error::Error>> {
+    setup_sigwinch_handler()?;
 
     let stdin_handle = stdin();
-    let orig_flags = wrap!(fcntl(&stdin_handle, FcntlArg::F_GETFL));
+    let orig_flags = fcntl(&stdin_handle, FcntlArg::F_GETFL)?;
     defer! {
         let _ = fcntl(&stdin_handle, FcntlArg::F_SETFL(OFlag::from_bits_truncate(orig_flags)));
     }
 
-    wrap!(set_nonblocking(&stdin_handle));
-    wrap!(enable_raw_mode());
+    set_nonblocking(&stdin_handle)?;
+    enable_raw_mode()?;
     defer! { let _ = disable_raw_mode(); }
 
     let mut stdin_lock = stdin_handle.lock();
     let mut stdout_lock = stdout().lock();
 
     // Application initialization and event execution loop
-    let mut app = wrap!(MuxApp::new());
-    wrap!(app.run(&mut stdin_lock, &mut stdout_lock));
+    let mut app = MuxApp::new()?;
+    app.run(&mut stdin_lock, &mut stdout_lock)?;
 
     Ok(())
 }
