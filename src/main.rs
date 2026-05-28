@@ -448,7 +448,12 @@ fn spawn_window(rows: u16, cols: u16) -> Result<Window, Box<dyn std::error::Erro
                 Ok(Window { master, parser })
             }
             ForkptyResult::Child => {
-                let shell = CString::new("/bin/bash").unwrap();
+                let native_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+
+                // Convert to CString, falling back to basic "/bin/sh" if a null byte sneaks in
+                let shell = CString::new(native_shell)
+                    .unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
+
                 let args = [shell.clone()];
                 let _ = execvp(&shell, &args);
                 std::process::exit(1);
