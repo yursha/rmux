@@ -31,6 +31,7 @@ pub fn spawn_pty(rows: u16, cols: u16) -> Result<OwnedFd, Box<dyn std::error::Er
                     CString::new(native_shell).unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
 
                 let args = [shell.clone()];
+                // todo: add error handling here
                 let _ = execvp(&shell, &args);
                 std::process::exit(1);
             }
