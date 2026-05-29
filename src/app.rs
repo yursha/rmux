@@ -16,6 +16,7 @@ enum LoopAction {
 struct Window {
     master: OwnedFd,
     parser: vt100::Parser,
+    bracketed_paste: bool,
 }
 
 pub struct MuxApp {
@@ -37,6 +38,7 @@ impl MuxApp {
         let first_window = Window {
             master: sys::spawn_pty(pty_rows, physical_size.ws_col)?,
             parser: vt100::Parser::new(pty_rows, physical_size.ws_col, 0),
+            bracketed_paste: false,
         };
 
         Ok(Self {
@@ -168,7 +170,16 @@ impl MuxApp {
                     return Ok(LoopAction::Redraw);
                 }
                 Ok(n) => {
-                    self.windows[win_idx].parser.process(&pty_buffer[..n]);
+                    let data = &pty_buffer[..n];
+
+                    // Scan the incoming PTY data for bracketed paste mode toggle sequences
+                    if data.windows(8).any(|w| w == b"\x1b[?2004h") {
+                        self.windows[win_idx].bracketed_paste = true;
+                    } else if data.windows(8).any(|w| w == b"\x1b[?2004l") {
+                        self.windows[win_idx].bracketed_paste = false;
+                    }
+
+                    self.windows[win_idx].parser.process(data);
                     if win_idx == self.current_window_idx {
                         pty_changed = true;
                     }
@@ -202,6 +213,7 @@ impl MuxApp {
         let new_win = Window {
             master: sys::spawn_pty(active_rows, host_size.ws_col)?,
             parser: vt100::Parser::new(active_rows, host_size.ws_col, 0),
+            bracketed_paste: false,
         };
         let next_token = 1 + self.windows.len();
         unsafe {
@@ -250,6 +262,13 @@ impl MuxApp {
         &self,
         stdout_lock: &mut StdoutLock,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Sync the host terminal's bracketed paste state with the active window
+        if self.windows[self.current_window_idx].bracketed_paste {
+            sys::write_stdout_blocking(stdout_lock, b"\x1b[?2004h")?;
+        } else {
+            sys::write_stdout_blocking(stdout_lock, b"\x1b[?2004l")?;
+        }
+
         let screen_contents = self.windows[self.current_window_idx]
             .parser
             .screen()

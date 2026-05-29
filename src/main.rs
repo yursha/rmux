@@ -28,4 +28,9 @@ fn main() {
 
     let mut app = app::MuxApp::new().unwrap();
     app.run(&mut stdin_lock, &mut stdout_lock).unwrap();
+
+    defer! {
+        // exit bracketed paste mode.
+        sys::write_stdout_blocking(&mut stdout_lock, b"\x1b[?2004l").expect("Failed to disable bracketed paste mode");
+    }
 }
